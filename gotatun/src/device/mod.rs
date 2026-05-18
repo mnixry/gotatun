@@ -41,7 +41,7 @@ use tokio::sync::{Mutex, watch};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Tunn, TunnResult};
+use crate::noise::{ProtocolIdentifier, Tunn, TunnResult};
 use crate::packet::{PacketBufPool, WgKind};
 use crate::task::Task;
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
@@ -123,6 +123,7 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     index_table: IndexTable,
 
     rate_limiter: Option<Arc<RateLimiter>>,
+    protocol_identifier: ProtocolIdentifier,
 
     port: u16,
     udp_factory: T::UdpTransportFactory,
@@ -367,13 +368,14 @@ impl<T: DeviceTransports> DeviceState<T> {
             .expect("Setting private key creates rate limiter")
             .clone();
 
-        let tunn = Tunn::new(
+        let tunn = Tunn::new_with_protocol_identifier(
             device_key_pair.0.clone(),
             peer_builder.public_key,
             peer_builder.preshared_key,
             peer_builder.keepalive,
             self.index_table.clone(),
             rate_limiter,
+            self.protocol_identifier,
         );
 
         PeerState::new(
@@ -557,7 +559,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         mut udp_rx: impl UdpRecv,
         mut packet_pool: PacketBufPool,
     ) -> Result<(), Error> {
-        let (private_key, public_key, rate_limiter, mut tun_mtu) = {
+        let (private_key, public_key, rate_limiter, protocol_identifier, mut tun_mtu) = {
             let Some(device) = device.upgrade() else {
                 return Ok(());
             };
@@ -566,7 +568,13 @@ impl<T: DeviceTransports> DeviceState<T> {
             let (private_key, public_key) = device.key_pair.clone().expect("Key not set");
             let rate_limiter = device.rate_limiter.clone().unwrap();
             let tun_mtu = device.tun_rx_mtu.clone();
-            (private_key, public_key, rate_limiter, tun_mtu)
+            (
+                private_key,
+                public_key,
+                rate_limiter,
+                device.protocol_identifier,
+                tun_mtu,
+            )
         };
 
         while let Ok((src_buf, addr)) = udp_rx.recv_from(&mut packet_pool).await {
@@ -590,10 +598,12 @@ impl<T: DeviceTransports> DeviceState<T> {
             let device_guard = device.read().await;
             let peers = &device_guard.peers;
             let peer = match &parsed_packet {
-                WgKind::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
-                    .ok()
-                    .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public)))
-                    .cloned(),
+                WgKind::HandshakeInit(p) => {
+                    parse_handshake_anon(&private_key, &public_key, &protocol_identifier, p)
+                        .ok()
+                        .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public)))
+                        .cloned()
+                }
                 WgKind::HandshakeResp(p) => device_guard
                     .peers_by_idx
                     .lock()

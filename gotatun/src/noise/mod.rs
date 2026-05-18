@@ -24,6 +24,8 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+pub use crate::noise::handshake::ProtocolIdentifier;
+
 use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 use zerocopy::IntoBytes;
 
@@ -96,7 +98,28 @@ impl Tunn<StdRng> {
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
-        Self::new_with_rng(
+        Self::new_with_protocol_identifier(
+            static_private,
+            peer_static_public,
+            preshared_key,
+            persistent_keepalive,
+            index_table,
+            rate_limiter,
+            ProtocolIdentifier::standard(),
+        )
+    }
+
+    /// Create a new tunnel using a custom Noise protocol construction and identifier.
+    pub fn new_with_protocol_identifier(
+        static_private: x25519::StaticSecret,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+        persistent_keepalive: Option<u16>,
+        index_table: IndexTable,
+        rate_limiter: Arc<RateLimiter>,
+        protocol_identifier: ProtocolIdentifier,
+    ) -> Self {
+        Self::new_with_rng_and_protocol_identifier(
             static_private,
             peer_static_public,
             preshared_key,
@@ -104,6 +127,7 @@ impl Tunn<StdRng> {
             index_table,
             rate_limiter,
             StdRng::from_os_rng(),
+            protocol_identifier,
         )
     }
 }
@@ -119,6 +143,29 @@ impl<R: RngCore + Send> Tunn<R> {
         rate_limiter: Arc<RateLimiter>,
         jitter_rng: R,
     ) -> Self {
+        Self::new_with_rng_and_protocol_identifier(
+            static_private,
+            peer_static_public,
+            preshared_key,
+            persistent_keepalive,
+            index_table,
+            rate_limiter,
+            jitter_rng,
+            ProtocolIdentifier::standard(),
+        )
+    }
+
+    /// Create a new tunnel using a custom Noise protocol construction, identifier, and RNG.
+    pub fn new_with_rng_and_protocol_identifier(
+        static_private: x25519::StaticSecret,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+        persistent_keepalive: Option<u16>,
+        index_table: IndexTable,
+        rate_limiter: Arc<RateLimiter>,
+        jitter_rng: R,
+        protocol_identifier: ProtocolIdentifier,
+    ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
         Tunn {
@@ -128,6 +175,7 @@ impl<R: RngCore + Send> Tunn<R> {
                 peer_static_public,
                 index_table,
                 preshared_key,
+                protocol_identifier,
             ),
             sessions: Default::default(),
             current: Default::default(),
@@ -519,6 +567,19 @@ mod tests {
     use mock_instant::thread_local::MockClock;
 
     fn create_two_tuns() -> (Tunn, Tunn) {
+        create_two_tuns_with_protocol_identifier(ProtocolIdentifier::standard())
+    }
+
+    fn create_two_tuns_with_protocol_identifier(
+        protocol_identifier: ProtocolIdentifier,
+    ) -> (Tunn, Tunn) {
+        create_two_tuns_with_protocol_identifiers(protocol_identifier, protocol_identifier)
+    }
+
+    fn create_two_tuns_with_protocol_identifiers(
+        my_protocol_identifier: ProtocolIdentifier,
+        their_protocol_identifier: ProtocolIdentifier,
+    ) -> (Tunn, Tunn) {
         let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
 
@@ -526,23 +587,25 @@ mod tests {
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
         let rate_limiter = Arc::new(RateLimiter::new(&my_public_key, HANDSHAKE_RATE_LIMIT));
-        let my_tun = Tunn::new(
+        let my_tun = Tunn::new_with_protocol_identifier(
             my_secret_key,
             their_public_key,
             None,
             None,
             IndexTable::from_os_rng(),
             rate_limiter,
+            my_protocol_identifier,
         );
 
         let rate_limiter = Arc::new(RateLimiter::new(&their_public_key, HANDSHAKE_RATE_LIMIT));
-        let their_tun = Tunn::new(
+        let their_tun = Tunn::new_with_protocol_identifier(
             their_secret_key,
             my_public_key,
             None,
             None,
             IndexTable::from_os_rng(),
             rate_limiter,
+            their_protocol_identifier,
         );
 
         (my_tun, their_tun)
@@ -740,6 +803,50 @@ mod tests {
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, init);
         let _keepalive = parse_handshake_resp(&mut my_tun, resp);
+    }
+
+    #[test]
+    fn custom_protocol_identifier_full_handshake() {
+        let protocol_identifier = ProtocolIdentifier::new(
+            b"gotatun custom construction test",
+            b"gotatun custom protocol test",
+        );
+        let (mut my_tun, mut their_tun) =
+            create_two_tuns_with_protocol_identifier(protocol_identifier);
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, init);
+        let keepalive = parse_handshake_resp(&mut my_tun, resp);
+        parse_keepalive(&mut their_tun, keepalive);
+    }
+
+    #[test]
+    fn custom_construction_full_handshake() {
+        let protocol_identifier =
+            ProtocolIdentifier::new(b"gotatun custom construction test", b"gotatun");
+        let (mut my_tun, mut their_tun) =
+            create_two_tuns_with_protocol_identifier(protocol_identifier);
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, init);
+        let keepalive = parse_handshake_resp(&mut my_tun, resp);
+        parse_keepalive(&mut their_tun, keepalive);
+    }
+
+    #[test]
+    fn mismatched_protocol_identifier_rejects_handshake() {
+        let protocol_identifier = ProtocolIdentifier::new(
+            b"gotatun custom construction test",
+            b"gotatun custom protocol test",
+        );
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_protocol_identifiers(
+            ProtocolIdentifier::standard(),
+            protocol_identifier,
+        );
+
+        let init = create_handshake_init(&mut my_tun);
+        assert!(matches!(
+            their_tun.handle_incoming_packet(WgKind::HandshakeInit(init)),
+            TunnResult::Err(WireGuardError::InvalidAeadTag)
+        ));
     }
 
     #[test]
